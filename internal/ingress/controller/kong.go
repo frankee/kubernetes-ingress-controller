@@ -267,9 +267,9 @@ func syncTargets(upstream string, ingressEndpopint *ingress.Backend, client *kon
 }
 
 // getPluginsFromAnnotations extracts plugins to be applied on an ingress/service from annotations
-func (n *NGINXController) getPluginsFromAnnotations(namespace string, anns map[string]string) (map[string]*pluginv1.KongPlugin, error) {
+func (n *NGINXController) getPluginsFromAnnotations(namespace string, anns map[string]string) (map[string][]*pluginv1.KongPlugin, error) {
 	pluginAnnotations := annotations.ExtractKongPluginAnnotations(anns)
-	pluginsInk8s := make(map[string]*pluginv1.KongPlugin)
+	pluginsInk8s := make(map[string][]*pluginv1.KongPlugin)
 	for plugin, crdNames := range pluginAnnotations {
 		for _, crdName := range crdNames {
 			// search configured plugin CRD in k8s
@@ -277,7 +277,7 @@ func (n *NGINXController) getPluginsFromAnnotations(namespace string, anns map[s
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("searching plugin KongPlugin %v", crdName))
 			}
-			pluginsInk8s[plugin] = k8sPlugin
+			pluginsInk8s[plugin] = append(pluginsInk8s[plugin], k8sPlugin)
 		}
 	}
 	pluginList := annotations.ExtractKongPluginsFromAnnotations(anns)
@@ -292,7 +292,7 @@ func (n *NGINXController) getPluginsFromAnnotations(namespace string, anns map[s
 			glog.Errorf("KongPlugin Custom resource '%v' has no `plugin` property, the plugin will not be configured", k8sPlugin.Name)
 			continue
 		}
-		pluginsInk8s[k8sPlugin.PluginName] = k8sPlugin
+		pluginsInk8s[k8sPlugin.PluginName] = append(pluginsInk8s[k8sPlugin.PluginName], k8sPlugin)
 	}
 	return pluginsInk8s, nil
 }
@@ -438,48 +438,150 @@ func (n *NGINXController) syncServices(ingressCfg *ingress.Configuration) (bool,
 				glog.Errorf("Unexpected error obtaining Kong plugins for service %v: %v", svc.ID, err)
 				continue
 			}
-			pluginsInKong := make(map[string]kong.Plugin)
+			pluginsInKong := make(map[string][]kong.Plugin)
 			for _, plugin := range plugins {
-				pluginsInKong[*plugin.Name] = *plugin
+				pluginsInKong[*plugin.Name] = append(pluginsInKong[*plugin.Name], *plugin)
 			}
 			var pluginsToDelete []kong.Plugin
 			var pluginsToCreate []kong.Plugin
 			var pluginsToUpdate []kong.Plugin
 
 			// Plugins present in Kong but not in k8s should be deleted
-			for _, plugin := range pluginsInKong {
-				if _, ok := pluginsInk8s[*plugin.Name]; !ok {
-					pluginsToDelete = append(pluginsToDelete, plugin)
+			//for _, plugin := range pluginsInKong {
+			//	if _, ok := pluginsInk8s[*plugin.Name]; !ok {
+			//		pluginsToDelete = append(pluginsToDelete, plugin)
+			//	}
+			//}
+			for name, plugins := range pluginsInKong {
+				if _, ok := pluginsInk8s[name]; !ok {
+					for _, plugin := range plugins {
+						pluginsToDelete = append(pluginsToDelete, plugin)
+					}
 				}
 			}
 
 			// Plugins present in k8s but not in Kong should be created
-			for pluginName, pluginInk8s := range pluginsInk8s {
-				if pluginInKong, ok := pluginsInKong[pluginName]; !ok {
-					p := kong.Plugin{
-						Name:    kong.String(pluginName),
-						Service: svc,
-						Config:  kong.Configuration(pluginInk8s.Config),
-					}
-					pluginsToCreate = append(pluginsToCreate, p)
-				} else {
-					enabled := false
-					if pluginInKong.Enabled != nil {
-						enabled = *pluginInKong.Enabled
-					}
-					// Plugins present in Kong and k8s need should have same configuration
-					if !pluginDeepEqual(pluginInk8s.Config, &pluginInKong) || // plugin conf
-						(pluginInk8s.ConsumerRef != "" && ((pluginInKong.Consumer == nil || isEmpty(pluginInKong.Consumer.ID)) || *pluginInKong.Consumer.ID != pluginInk8s.ConsumerRef)) || // consumerID
-						// plugin disabled?
-						(!pluginInk8s.Disabled != enabled) {
-						glog.Infof("plugin %v configuration in kong is outdated. Updating...", pluginInk8s.Name)
+			for pluginName, pluginsInk8s := range pluginsInk8s {
+				if pluginsInKong, ok := pluginsInKong[pluginName]; !ok {
+					for _, plugin := range pluginsInk8s {
 						p := kong.Plugin{
-							Name:   pluginInKong.Name,
+							Name:    kong.String(pluginName),
+							Service: svc,
+							Config:  kong.Configuration(plugin.Config),
+						}
+						pluginsToCreate = append(pluginsToCreate, p)
+					}
+				} else {
+					sameConfigLinkInKong := make([]int, len(pluginsInKong))
+					for i := 0; i < len(sameConfigLinkInKong); i++ {
+						sameConfigLinkInKong[i] = -1
+					}
+
+					sameConfigLinkInk8s := make([]bool, len(pluginsInk8s))
+					for idxInKong, pluginInKong := range pluginsInKong {
+						for idxInk8s, pluginInk8s := range pluginsInk8s {
+							if sameConfigLinkInk8s[idxInk8s] {
+								continue
+							}
+
+							if pluginDeepEqual(pluginInk8s.Config, &pluginInKong) {
+								if sameConfigLinkInKong[idxInKong] >= 0 {
+									// if the consumer is the same then update the link
+									if pluginInk8s.ConsumerRef != "" && pluginInKong.Consumer != nil && !isEmpty(pluginInKong.Consumer.ID) && pluginInk8s.ConsumerRef == *pluginInKong.Consumer.ID {
+										sameConfigLinkInk8s[sameConfigLinkInKong[idxInKong]] = false
+
+										sameConfigLinkInKong[idxInKong] = idxInk8s
+										sameConfigLinkInk8s[idxInk8s] = true
+										glog.Infof("plugin %v:%v %v configuration in kong is the same.", pluginInk8s.PluginName, pluginInk8s.Name, *pluginInKong.ID)
+									}
+								} else {
+									sameConfigLinkInKong[idxInKong] = idxInk8s
+									sameConfigLinkInk8s[idxInk8s] = true
+									glog.Infof("plugin %v:%v %v configuration in kong is the same.", pluginInk8s.PluginName, pluginInk8s.Name, *pluginInKong.ID)
+								}
+							}
+						}
+					}
+
+					for kongIndex, k8sIndex := range sameConfigLinkInKong {
+						pluginInKong := pluginsInKong[kongIndex]
+						pluginInk8s := pluginsInk8s[k8sIndex]
+
+						enabled := false
+						if pluginInKong.Enabled != nil {
+							enabled = *pluginInKong.Enabled
+						}
+
+						if (pluginInk8s.ConsumerRef != "" && ((pluginInKong.Consumer == nil || isEmpty(pluginInKong.Consumer.ID)) || *pluginInKong.Consumer.ID != pluginInk8s.ConsumerRef)) || // consumerID
+						// plugin disabled?
+							(!pluginInk8s.Disabled != enabled) {
+							glog.Infof("plugin %v configuration in kong is outdated. Updating...", pluginInk8s.Name)
+							p := kong.Plugin{
+								Name:   pluginInKong.Name,
+								Config: kong.Configuration(pluginInk8s.Config),
+
+								Enabled: kong.Bool(!pluginInk8s.Disabled),
+								Service: svc,
+								ID:      kong.String(*pluginInKong.ID),
+							}
+							if pluginInk8s.ConsumerRef != "" {
+								consumer, err := n.store.GetKongConsumer(pluginInk8s.Namespace, pluginInk8s.ConsumerRef)
+								if err != nil {
+									glog.Errorf("Unexpected error searching for consumer %v: %v",
+										pluginInk8s.ConsumerRef, err)
+									continue
+								}
+								p.Consumer = &kong.Consumer{
+									ID: kong.String(fmt.Sprintf("%v", consumer.GetUID())),
+								}
+							}
+							pluginsToUpdate = append(pluginsToUpdate, p)
+						}
+					}
+
+					var otherPluginsInKong []kong.Plugin
+					var otherPluginsInk8s []*pluginv1.KongPlugin
+
+					for i, pluginInKong := range pluginsInKong {
+						if sameConfigLinkInKong[i] < 0 {
+							otherPluginsInKong = append(otherPluginsInKong, pluginInKong)
+						}
+					}
+					for i, pluginInk8s := range pluginsInk8s {
+						if !sameConfigLinkInk8s[i] {
+							otherPluginsInk8s = append(otherPluginsInk8s, pluginInk8s)
+						}
+					}
+
+					othersCountInKong := len(otherPluginsInKong)
+					othersCountInk8s := len(otherPluginsInk8s)
+					updateCount := 0
+					if othersCountInKong > othersCountInk8s {
+						pluginsToDelete = append(pluginsToDelete, otherPluginsInKong[othersCountInk8s:]...)
+						updateCount = othersCountInk8s
+					} else {
+						for i := othersCountInKong; i < othersCountInk8s; i++ {
+							p := kong.Plugin{
+								Name:    kong.String(pluginName),
+								Service: svc,
+								Config:  kong.Configuration(otherPluginsInk8s[i].Config),
+							}
+							pluginsToCreate = append(pluginsToCreate, p)
+						}
+
+						updateCount = othersCountInKong
+					}
+
+					for i:= 0; i < updateCount; i++ {
+						pluginInk8s := otherPluginsInk8s[i]
+						glog.Infof("plugin %v configuration in kong is outdated. Updating...", pluginName)
+						p := kong.Plugin{
+							Name:   &pluginName,
 							Config: kong.Configuration(pluginInk8s.Config),
 
 							Enabled: kong.Bool(!pluginInk8s.Disabled),
 							Service: svc,
-							ID:      kong.String(*pluginInKong.ID),
+							ID:      kong.String(*otherPluginsInKong[i].ID),
 						}
 						if pluginInk8s.ConsumerRef != "" {
 							consumer, err := n.store.GetKongConsumer(pluginInk8s.Namespace, pluginInk8s.ConsumerRef)
@@ -847,7 +949,8 @@ func (n *NGINXController) syncRoutes(ingressCfg *ingress.Configuration) (bool, e
 				}
 			}
 			// Plugins present in k8s but not in Kong should be created
-			for pluginName, pluginInk8s := range pluginsInk8s {
+			for pluginName, pluginsInk8s := range pluginsInk8s {
+				pluginInk8s := pluginsInk8s[0]
 				if pluginInKong, ok := pluginsInKong[pluginName]; !ok {
 					p := kong.Plugin{
 						Name:   kong.String(pluginName),
